@@ -1,21 +1,27 @@
 /****************************************************
- *  GO TIME NECKLACE – ESP32-C3
+ *  GO TIME NECKLACE – ESP32-C3 (Async + Secure SPIFFS)
  *  Rear-approach notifier for walking & skating
  *  - 1 microwave radar sensor
  *  - 1 IMU
  *  - 1 vibration motor
  *  - 1 touch sensor (mode navigation)
  *  - Phone-enhanced via Wi-Fi API
- *  - Go Time themed web UI
+ *  - Go Time themed web UI + secure /upload
  ****************************************************/
 
 #include <Arduino.h>
 #include <WiFi.h>
-#include <WebServer.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <SPIFFS.h>
 
 // ====== USER CONFIG ======
 const char* AP_SSID     = "GoTimeNecklace";
 const char* AP_PASSWORD = "boardwalk";
+
+// Secure uploader credentials
+const char* UPLOAD_USER = "admin";
+const char* UPLOAD_PASS = "gotime123";
 
 // Pins (adjust to your board)
 #define PIN_VIBE      5    // vibration motor
@@ -25,7 +31,7 @@ const char* AP_PASSWORD = "boardwalk";
 #define PIN_IMU_SDA   9    // I2C SDA
 
 // ====== SERVER ======
-WebServer server(80);
+AsyncWebServer server(80);
 
 // ====== MODES ======
 enum Mode {
@@ -67,10 +73,6 @@ unsigned long lastSpeedUpdateMs = 0;
 // ====== FORWARD DECLARATIONS ======
 void setupWiFiAP();
 void setupWebServer();
-void handleRoot();
-void handleState();
-void handlePhoneUpdate();
-void handleModeChange();
 
 void readRadar(RadarState &r);
 void readIMU(IMUState &i);
@@ -88,52 +90,7 @@ void vibrateDanger();
 
 void handleTouch();
 
-// ====== SETUP ======
-void setup() {
-  Serial.begin(115200);
-  delay(200);
-
-  pinMode(PIN_VIBE, OUTPUT);
-  pinMode(PIN_TOUCH, INPUT);
-
-  // Radar + IMU pins (stubs)
-  pinMode(PIN_RADAR, INPUT);
-
-  setupWiFiAP();
-  setupWebServer();
-
-  phone.connected = false;
-  phone.hasSpeed = false;
-  phone.speedMps = 0.0;
-
-  lastSpeedUpdateMs = millis();
-}
-
-// ====== LOOP ======
-void loop() {
-  server.handleClient();
-
-  readRadar(radar);
-  readIMU(imu);
-  computeUserSpeed();
-  handleTouch();
-  applyLogic();
-}
-
-// ====== WIFI + WEB ======
-void setupWiFiAP() {
-  WiFi.mode(WIFI_AP);
-  WiFi.softAP(AP_SSID, AP_PASSWORD);
-}
-
-void setupWebServer() {
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/state", HTTP_GET, handleState);
-  server.on("/phone", HTTP_POST, handlePhoneUpdate);
-  server.on("/mode", HTTP_POST, handleModeChange);
-  server.begin();
-}
-
+// ====== INLINE HTML (INDEX) ======
 const char HTML_INDEX[] PROGMEM = R"HTML(
 <!DOCTYPE html>
 <html>
@@ -183,39 +140,149 @@ fetchState();
 </html>
 )HTML";
 
-void handleRoot() {
-  server.send_P(200, "text/html", HTML_INDEX);
-}
+// ====== SETUP ======
+void setup() {
+  Serial.begin(115200);
+  delay(200);
 
-void handleState() {
-  String json = "{";
-  json += "\"mode\":" + String((int)currentMode) + ",";
-  json += "\"userSpeedMps\":" + String(userSpeedMps,2) + ",";
-  json += "\"radarDopplerHz\":" + String(radar.dopplerHz,2) + ",";
-  json += "\"radarStrength\":" + String(radar.strength,2) + ",";
-  json += "\"radarDistanceM\":" + String(radar.distanceM,2) + ",";
-  json += "\"phoneConnected\":" + String(phone.connected ? "true":"false") + ",";
-  json += "\"phoneSpeedMps\":" + String(phone.speedMps,2) + ",";
-  json += "\"phoneHasSpeed\":" + String(phone.hasSpeed ? "true":"false");
-  json += "}";
-  server.send(200, "application/json", json);
-}
+  pinMode(PIN_VIBE, OUTPUT);
+  pinMode(PIN_TOUCH, INPUT);
+  pinMode(PIN_RADAR, INPUT);
 
-void handlePhoneUpdate() {
-  if (server.hasArg("speed")) {
-    phone.speedMps = server.arg("speed").toFloat();
-    phone.hasSpeed = true;
-    phone.connected = true;
+  if (!SPIFFS.begin(true)) {
+    Serial.println("SPIFFS mount failed");
   }
-  server.send(200, "text/plain", "PHONE UPDATE OK");
+
+  // Create upload.html in SPIFFS (once per boot)
+  File uploadPage = SPIFFS.open("/upload.html", FILE_WRITE);
+  uploadPage.print(
+    "<html><head><meta name='viewport' content='width=device-width,initial-scale=1'/>"
+    "<title>Go Time Upload</title>"
+    "<style>body{background:#020617;color:#e5e7eb;font-family:sans-serif;padding:16px;}h1{color:#38bdf8;}input,button{margin:8px 0;padding:8px;border-radius:6px;border:none;}button{background:#facc15;color:#111827;font-weight:600;}</style>"
+    "</head><body>"
+    "<h1>Go Time Necklace · File Upload</h1>"
+    "<form method='POST' action='/upload' enctype='multipart/form-data'>"
+    "<input type='file' name='data'><br>"
+    "<button type='submit'>Upload</button>"
+    "</form>"
+    "<p>Upload index.html, style.css, app.js, etc.</p>"
+    "</body></html>"
+  );
+  uploadPage.close();
+
+  setupWiFiAP();
+  setupWebServer();
+
+  phone.connected = false;
+  phone.hasSpeed = false;
+  phone.speedMps = 0.0;
+
+  lastSpeedUpdateMs = millis();
 }
 
-void handleModeChange() {
-  if (server.hasArg("mode")) {
-    int m = server.arg("mode").toInt();
-    if (m >= 0 && m <= 2) currentMode = (Mode)m;
-  }
-  server.send(200, "text/plain", "MODE OK");
+// ====== LOOP ======
+void loop() {
+  readRadar(radar);
+  readIMU(imu);
+  computeUserSpeed();
+  handleTouch();
+  applyLogic();
+}
+
+// ====== WIFI + WEB ======
+void setupWiFiAP() {
+  WiFi.mode(WIFI_MODE_AP);
+  WiFi.softAP(AP_SSID, AP_PASSWORD);
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+}
+
+void setupWebServer() {
+  // Root UI
+  server.on("/", HTTP_GET, [](AsyncWebServerRequest *request){
+    request->send_P(200, "text/html", HTML_INDEX);
+  });
+
+  // State JSON
+  server.on("/state", HTTP_GET, [](AsyncWebServerRequest *request){
+    String json = "{";
+    json += "\"mode\":" + String((int)currentMode) + ",";
+    json += "\"userSpeedMps\":" + String(userSpeedMps,2) + ",";
+    json += "\"radarDopplerHz\":" + String(radar.dopplerHz,2) + ",";
+    json += "\"radarStrength\":" + String(radar.strength,2) + ",";
+    json += "\"radarDistanceM\":" + String(radar.distanceM,2) + ",";
+    json += "\"phoneConnected\":" + String(phone.connected ? "true":"false") + ",";
+    json += "\"phoneSpeedMps\":" + String(phone.speedMps,2) + ",";
+    json += "\"phoneHasSpeed\":" + String(phone.hasSpeed ? "true":"false");
+    json += "}";
+    request->send(200, "application/json", json);
+  });
+
+  // Phone speed update
+  server.on("/phone", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (request->hasParam("speed", true)) {
+      AsyncWebParameter* p = request->getParam("speed", true);
+      phone.speedMps = p->value().toFloat();
+      phone.hasSpeed = true;
+      phone.connected = true;
+    }
+    request->send(200, "text/plain", "PHONE UPDATE OK");
+  });
+
+  // Mode change
+  server.on("/mode", HTTP_POST, [](AsyncWebServerRequest *request){
+    if (request->hasParam("mode", true)) {
+      AsyncWebParameter* p = request->getParam("mode", true);
+      int m = p->value().toInt();
+      if (m >= 0 && m <= 2) currentMode = (Mode)m;
+    }
+    request->send(200, "text/plain", "MODE OK");
+  });
+
+  // Secure SPIFFS uploader
+  server.on("/upload", HTTP_GET, [](AsyncWebServerRequest *request){
+    if (!request->authenticate(UPLOAD_USER, UPLOAD_PASS))
+      return request->requestAuthentication();
+    request->send(SPIFFS, "/upload.html", "text/html");
+  });
+
+  server.on(
+    "/upload",
+    HTTP_POST,
+    [](AsyncWebServerRequest *request){
+      if (!request->authenticate(UPLOAD_USER, UPLOAD_PASS))
+        return request->requestAuthentication();
+      request->send(200, "text/plain", "Upload complete. Refresh the page.");
+    },
+    [](AsyncWebServerRequest *request, String filename, size_t index, uint8_t *data, size_t len, bool final){
+      if (!request->authenticate(UPLOAD_USER, UPLOAD_PASS))
+        return;
+
+      String path = "/" + filename;
+
+      if (index == 0) {
+        Serial.printf("UploadStart: %s\n", filename.c_str());
+        if (SPIFFS.exists(path)) {
+          SPIFFS.remove(path);
+        }
+      }
+
+      File f = SPIFFS.open(path, FILE_APPEND);
+      if (!f) {
+        Serial.println("File open failed");
+        return;
+      }
+      f.write(data, len);
+      f.close();
+
+      if (final) {
+        Serial.printf("UploadEnd: %s (%u bytes)\n", filename.c_str(), index + len);
+      }
+    }
+  );
+
+  server.begin();
+  Serial.println("Go Time Necklace server started (Async + secure uploader)");
 }
 
 // ====== SENSOR STUBS ======
@@ -264,8 +331,8 @@ void computeUserSpeed() {
 // ====== OBJECT CLASSIFICATION ======
 float classifyObjectType(const RadarState &r) {
   // 0 = unknown, 1 = person, 2 = vehicle
-  const float DOPPLER_PERSON = 50.0;   // Hz
-  const float DOPPLER_VEHICLE = 150.0; // Hz
+  const float DOPPLER_PERSON  = 50.0;   // Hz
+  const float DOPPLER_VEHICLE = 150.0;  // Hz
   const float STRENGTH_VEHICLE = 0.7;
 
   if (r.dopplerHz > DOPPLER_VEHICLE && r.strength > STRENGTH_VEHICLE) return 2.0;
@@ -275,7 +342,6 @@ float classifyObjectType(const RadarState &r) {
 
 float estimateObjectSpeed(const RadarState &r) {
   // Very rough mapping: doppler Hz → m/s
-  // You will calibrate this with real radar.
   return r.dopplerHz * 0.02; // placeholder
 }
 
@@ -286,30 +352,6 @@ float computeTOC(float objectSpeed, float userSpeed, float distance) {
 }
 
 // ====== LOGIC + VIBRATION ======
-void applyLogic() {
-  // If radar sees nothing, do nothing
-  if (radar.strength < 0.1) return;
-
-  float objType = classifyObjectType(radar);
-  float objSpeed = estimateObjectSpeed(radar);
-  float toc = computeTOC(objSpeed, userSpeedMps, radar.distanceM);
-
-  const float TOC_DANGER = 2.0; // seconds
-
-  if (toc < TOC_DANGER) {
-    vibrateDanger();
-    return;
-  }
-
-  if (objType == 2.0) {
-    vibratePatternVehicle(toc);
-  } else if (objType == 1.0) {
-    vibratePatternPerson(toc);
-  } else {
-    vibratePatternUnknown(toc);
-  }
-}
-
 void vibrateMotor(int ms) {
   digitalWrite(PIN_VIBE, HIGH);
   delay(ms);
@@ -318,7 +360,6 @@ void vibrateMotor(int ms) {
 }
 
 void vibratePatternPerson(float toc) {
-  // Walking: softer, Skating: sharper
   if (currentMode == MODE_WALK) {
     vibrateMotor(120);
     vibrateMotor(120);
@@ -344,11 +385,33 @@ void vibratePatternUnknown(float toc) {
 }
 
 void vibrateDanger() {
-  // GO TIME pattern: continuous buzz
   digitalWrite(PIN_VIBE, HIGH);
   delay(500);
   digitalWrite(PIN_VIBE, LOW);
   delay(150);
+}
+
+void applyLogic() {
+  if (radar.strength < 0.1) return;
+
+  float objType = classifyObjectType(radar);
+  float objSpeed = estimateObjectSpeed(radar);
+  float toc = computeTOC(objSpeed, userSpeedMps, radar.distanceM);
+
+  const float TOC_DANGER = 2.0; // seconds
+
+  if (toc < TOC_DANGER) {
+    vibrateDanger();
+    return;
+  }
+
+  if (objType == 2.0) {
+    vibratePatternVehicle(toc);
+  } else if (objType == 1.0) {
+    vibratePatternPerson(toc);
+  } else {
+    vibratePatternUnknown(toc);
+  }
 }
 
 // ====== TOUCH NAVIGATION ======
@@ -357,7 +420,6 @@ void handleTouch() {
   bool touchNow = digitalRead(PIN_TOUCH) == HIGH;
 
   if (touchNow && !lastTouch) {
-    // Single tap: cycle mode
     int m = (int)currentMode + 1;
     if (m > 2) m = 0;
     currentMode = (Mode)m;
