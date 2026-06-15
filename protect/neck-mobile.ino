@@ -1,12 +1,11 @@
 /****************************************************
- * GO TIME NECKLACE – ESP32-C3
- * Screenless safety wearable
- * - Radar (rear approach)
- * - IMU (your movement)
- * - Touch sensor (mode switch)
+ * GO TIME NECKLACE – ESP32-C3 (Rear Radar Version)
+ * - Rear-facing radar on back of leather necklace
+ * - IMU for your movement
+ * - Touch sensor for modes + phone ring
  * - Single vibration motor
- * - ESP-NOW (van alerts)
- * - BLE hook (phone ring)
+ * - ESP-NOW for van alerts
+ * - BLE hook for FIND_PHONE
  ****************************************************/
 
 #include <Arduino.h>
@@ -22,7 +21,7 @@
 // =====================
 #define PIN_VIBE        5   // vibration motor via transistor
 #define PIN_TOUCH       6   // touch sensor
-#define PIN_RADAR       7   // radar input (ADC or digital)
+#define PIN_RADAR       7   // rear-facing radar input (ADC or digital)
 #define PIN_IMU_SCL     8   // I2C SCL (IMU)
 #define PIN_IMU_SDA     9   // I2C SDA (IMU)
 
@@ -85,12 +84,10 @@ void onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
 // =====================
 BLEServer* pServer = nullptr;
 BLECharacteristic* pChar = nullptr;
-bool deviceConnected = false;
 
 #define BLE_SERVICE_UUID        "12345678-1234-1234-1234-1234567890ab"
 #define BLE_CHARACTERISTIC_UUID "87654321-4321-4321-4321-ba0987654321"
 
-// When we write "FIND_PHONE" to this characteristic, Android app rings phone.
 void setupBLE() {
   BLEDevice::init("GoTimeNecklace");
   pServer = BLEDevice::createServer();
@@ -145,7 +142,8 @@ void setup() {
   pinMode(PIN_TOUCH, INPUT);
   pinMode(PIN_RADAR, INPUT);
 
-  // IMU init would go here (Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL); etc.)
+  // IMU init (wire up your IMU here)
+  // Wire.begin(PIN_IMU_SDA, PIN_IMU_SCL);
 
   WiFi.mode(WIFI_STA);
   setupEspNow();
@@ -190,7 +188,7 @@ void setupEspNow() {
 // =====================
 void readRadar(RadarState &r) {
   // TODO: replace with real radar reads
-  // For now, no detection:
+  // Rear-facing radar: distance is behind you.
   r.dopplerHz = 0.0;
   r.strength  = 0.0;
   r.distanceM = 4.0; // assume 4m behind
@@ -211,7 +209,6 @@ void computeUserSpeed() {
   if (dt <= 0) dt = 0.01;
   lastSpeedUpdateMs = now;
 
-  // AUTO mode: decide walking vs skating by IMU
   bool walking = false;
   bool skating = false;
 
@@ -220,21 +217,18 @@ void computeUserSpeed() {
     if (imu.forwardAccel > 0.4f) skating = true;
   }
 
-  // Walking: step frequency
   if (walking) {
     const float STEP_LENGTH_M = 0.78f;
     userSpeedMps = imu.stepFrequency * STEP_LENGTH_M;
     return;
   }
 
-  // Skating: integrate acceleration
   if (skating) {
     userSpeedMps += imu.forwardAccel * dt;
     if (userSpeedMps < 0) userSpeedMps = 0;
     return;
   }
 
-  // Otherwise, decay speed slowly
   userSpeedMps *= 0.95f;
   if (userSpeedMps < 0.1f) userSpeedMps = 0.0f;
 }
@@ -243,8 +237,8 @@ void computeUserSpeed() {
 // OBJECT CLASSIFICATION
 // =====================
 float classifyObjectType(const RadarState &r) {
-  const float DOPPLER_PERSON  = 50.0;
-  const float DOPPLER_VEHICLE = 150.0;
+  const float DOPPLER_PERSON   = 50.0;
+  const float DOPPLER_VEHICLE  = 150.0;
   const float STRENGTH_VEHICLE = 0.7;
 
   if (r.dopplerHz > DOPPLER_VEHICLE && r.strength > STRENGTH_VEHICLE) return 2.0;
@@ -253,8 +247,7 @@ float classifyObjectType(const RadarState &r) {
 }
 
 float estimateObjectSpeed(const RadarState &r) {
-  // Placeholder mapping: doppler Hz → m/s
-  return r.dopplerHz * 0.02;
+  return r.dopplerHz * 0.02; // placeholder mapping
 }
 
 float computeTOC(float objectSpeed, float userSpeed, float distance) {
@@ -267,34 +260,31 @@ float computeTOC(float objectSpeed, float userSpeed, float distance) {
 // LOGIC + VIBRATION
 // =====================
 void applyLogic() {
-  // Handle van alerts first (if mode allows)
+  // Van alerts first (if mode allows)
   if ((currentMode == MODE_VAN_LINKED || currentMode == MODE_AUTO) && vanAlert.type != 0) {
     vibrateVanAlert(vanAlert.type);
     vanAlert.type = 0;
     return;
   }
 
-  // Radar-based personal awareness
-  if (radar.strength < 0.1) return; // nothing detected
+  // Rear radar-based personal awareness
+  if (radar.strength < 0.1) return;
 
   float objType   = classifyObjectType(radar);
   float objSpeed  = estimateObjectSpeed(radar);
   float toc       = computeTOC(objSpeed, userSpeedMps, radar.distanceM);
   const float TOC_DANGER = 2.0;
 
-  // Stealth mode: only true danger
   if (currentMode == MODE_STEALTH) {
     if (toc < TOC_DANGER) vibrateDanger();
     return;
   }
 
-  // Danger first
   if (toc < TOC_DANGER) {
     vibrateDanger();
     return;
   }
 
-  // Presence vs approach
   if (objType == 2.0) {
     vibrateVehicle(toc);
   } else if (objType == 1.0) {
@@ -312,13 +302,11 @@ void vibrateMotor(int ms) {
 }
 
 void vibratePerson(float toc) {
-  // People near: softer pattern
   vibrateMotor(120);
   vibrateMotor(120);
 }
 
 void vibrateVehicle(float toc) {
-  // Vehicle near: stronger pattern
   vibrateMotor(300);
 }
 
@@ -327,14 +315,12 @@ void vibrateUnknown(float toc) {
 }
 
 void vibrateDanger() {
-  // GO TIME pattern
   digitalWrite(PIN_VIBE, HIGH);
   delay(500);
   digitalWrite(PIN_VIBE, LOW);
   delay(150);
 }
 
-// Van alert patterns
 void vibrateVanAlert(uint8_t type) {
   switch (type) {
     case 1: // door
@@ -369,20 +355,16 @@ void handleTouch() {
   bool touchNow = digitalRead(PIN_TOUCH) == HIGH;
   unsigned long now = millis();
 
-  // Rising edge
   if (touchNow && !lastTouch) {
     tapCount++;
     lastTapTime = now;
   }
 
-  // Double-tap detection for phone ring
   if (tapCount >= 2 && (now - lastTapTime) < 500) {
-    // Double tap → find phone
     sendFindPhone();
     tapCount = 0;
   }
 
-  // Single tap mode cycle (if no double tap)
   if (!touchNow && lastTouch) {
     if ((now - lastTapTime) > 500 && tapCount == 1) {
       int m = (int)currentMode + 1;
@@ -392,7 +374,6 @@ void handleTouch() {
     }
   }
 
-  // Reset tap count if too long
   if ((now - lastTapTime) > 1000) {
     tapCount = 0;
   }
